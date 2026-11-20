@@ -1,5 +1,49 @@
 # Day 11 — Controlled Agent Security (2026)
 
+## Thông tin bài nộp
+
+| | |
+|---|---|
+| **Họ tên** | Nguyễn Trọng Lâm |
+| **MSSV** | 2A202603817 |
+| **Lớp / Khóa** | K5 · L3B · Day 11 |
+
+### Cách chạy ngắn
+
+```powershell
+# 1. Setup (Windows PowerShell — macOS/Linux: source .venv/bin/activate, cp .env.example .env)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env   # điền OPENROUTER_API_KEY + RED_TEAM_PROVIDER=openai + OPENAI_API_KEY
+
+# 2. Chạy lab (từ gốc repo)
+python src/main.py --part 2   # CP2: test input/output guardrails (in ra terminal)
+python src/main.py --part 3   # CP3: pipeline Blue → outputs/results.json, audit_log.json, metrics.json
+python src/main.py --part 4   # CP4: tấn công Red + Red Advance → outputs/attack_results.json
+
+# 3. Tự kiểm
+pytest tests/smoke -q
+pytest tests/public -q
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+### Phần đã làm
+
+| Checkpoint | File | Nội dung |
+|---|---|---|
+| CP2 | `src/guardrails/input_guardrails.py` | `detect_injection` (chuẩn hoá Unicode / zero-width / full-width, regex EN + VI), `topic_filter`, `InputGuardrailPlugin` |
+| CP2 | `src/guardrails/output_guardrails.py` | `content_filter` (SĐT, email, CCCD/CMND, API key, password, host nội bộ, secret thô + mã hoá base64/hex/đảo ngược), `OutputGuardrailPlugin` |
+| CP3 | `src/assignment/rate_limiter.py` | Sliding window theo `user_id` |
+| CP3 | `src/assignment/audit_log.py` | Ghi input/output, layer chặn, latency → `audit_log.json` |
+| CP3 | `src/assignment/monitoring.py` | Metrics + alert (block rate, rate-limit hits, judge fail) → `metrics.json` |
+| CP3 | `src/assignment/pipeline.py` | Thứ tự plugin, egress allowlist, chạy 4 nhóm test → `results.json` |
+| CP4 | `src/attacks/attacks.py` | 5 prompt tấn công (Completion, Translation, Hypothetical, Confirmation, Multi-step) |
+
+Kết quả (`outputs/lab_report.md`): safe bị chặn nhầm **0/7** · attack bị chặn **10/10** · rate limit chặn **5/15** · Red leak **3/5** · Red Advance leak **0/5** · public tests **10/10**.
+
+---
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
