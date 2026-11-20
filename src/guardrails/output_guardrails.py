@@ -27,6 +27,71 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+REDACTED = "[REDACTED]"
+
+# Official public contacts (ground truth) — allowed to appear in replies.
+ALLOWED_CONTACTS = {"support@vinbank.example"}
+
+# (issue_type, pattern, keep_group)
+#   keep_group = index of a capture group to keep (label such as "password is ")
+#   so only the *value* gets redacted; None → redact the whole match.
+# Order matters: specific secrets first, generic numbers last, so a secret
+# like "sk-…" isn't half-eaten by a looser pattern.
+PII_PATTERNS: list[tuple[str, str, int | None]] = [
+    # API keys: "sk-…" tokens and "api key: xyz"
+    ("api_key", r"\bsk-[A-Za-z0-9_\-]{6,}", None),
+    ("api_key", r"(\bapi[\s_-]?key\s*(?:is|=|:)\s*)[^\s,;]+", 1),
+    # Passwords: "password is X", "password=X", "mật khẩu: X"
+    (
+        "password",
+        r"(\b(?:password|passwd|pwd|passcode|m[aậ]t kh[aẩ]u)\s*(?:is|=|:|l[aà])\s*)[^\s,;]+",
+        1,
+    ),
+    # Internal hostnames / DB endpoints (db.vinbank.internal:5432)
+    ("internal_host", r"\b[\w-]+(?:\.[\w-]+)*\.(?:internal|local|corp)(?::\d{2,5})?\b", None),
+    # Email
+    ("email", r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b", None),
+    # VN phone: 0xxxxxxxxx (10 số di động) / 0xxxxxxxxxx (11 số cố định) / +84…,
+    # allowing spaces, dots or dashes between digits. Hotline 1900… is not PII.
+    ("phone", r"(?<![\w])(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)", None),
+    # National ID: CCCD 12 digits / CMND 9 digits (not money amounts)
+    ("national_id", r"(?<!\d)(?:\d{12}|\d{9})(?!\d)(?!\s*(?:vnd|vnđ|đ|dong|usd))", None),
+]
+_COMPILED = [(n, re.compile(p, re.IGNORECASE), g) for n, p, g in PII_PATTERNS]
+
+
+def _secret_needles() -> tuple[list[str], list[str]]:
+    """Exact protected values + simple encodings of them (base64/hex/reversed).
+
+    Regex alone misses a leaked secret written without a label ("it's admin123")
+    or lightly encoded — the classic red-team bypasses.
+    """
+    import base64
+
+    try:
+        from core.config import DEMO_SECRETS
+    except Exception:  # pragma: no cover - config missing
+        DEMO_SECRETS = []
+    plain = [s for s in DEMO_SECRETS if s]
+    encoded: list[str] = []
+    for s in plain:
+        raw = s.encode()
+        encoded += [
+            s[::-1],
+            base64.b64encode(raw).decode().rstrip("="),
+            raw.hex(),
+        ]
+    return plain, [e for e in encoded if len(e) >= 6]
+
+
+_SECRET_PLAIN, _SECRET_ENCODED = _secret_needles()
+
+
+def _redact_literal(text: str, needle: str, suffix: str = "") -> tuple[str, int]:
+    rx = re.compile(re.escape(needle) + suffix, re.IGNORECASE)
+    return rx.subn(REDACTED, text)
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -36,24 +101,38 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
-    redacted = response
+    issues: list[str] = []
+    redacted = response or ""
+    counts: dict[str, int] = {}
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    def bump(kind: str, n: int) -> None:
+        if n:
+            counts[kind] = counts.get(kind, 0) + n
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    # 1. Generic PII / secret patterns (gives precise issue types)
+    for name, rx, keep in _COMPILED:
+        def _sub(m: re.Match, keep=keep, name=name) -> str:
+            value = m.group(0)
+            if name == "email" and value.lower() in ALLOWED_CONTACTS:
+                return value  # official support address is public
+            if keep and m.group(0)[len(m.group(keep)):].startswith(REDACTED):
+                return value  # already redacted
+            bump(name, 1)
+            return (m.group(keep) + REDACTED) if keep else REDACTED
+
+        redacted = rx.sub(_sub, redacted)
+
+    # 2. Safety net: protected values that slipped past the patterns
+    #    (unlabelled "it's admin123", or base64 / hex / reversed encodings)
+    for needle in _SECRET_PLAIN:
+        redacted, n = _redact_literal(redacted, needle)
+        bump("secret", n)
+    for needle in _SECRET_ENCODED:
+        redacted, n = _redact_literal(redacted, needle, suffix="=*")  # eat base64 padding
+        bump("encoded_secret", n)
+
+    for kind, n in counts.items():
+        issues.append(f"{kind}: {n} found")
 
     return {
         "safe": len(issues) == 0,
@@ -149,6 +228,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []  # issues of the most recent response (for audit)
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +252,33 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_issues = []
 
-        return llm_response  # TODO: modify if needed
+        # 1. Deterministic filter: redact PII / secrets
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_issues = result["issues"]
+            response_text = result["redacted"]
+            llm_response.content = self._text_content(response_text)
+
+        # 2. Optional LLM-as-Judge on the (already redacted) text
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_issues.append(f"judge: {verdict['verdict'][:80]}")
+                llm_response.content = self._text_content(
+                    "I'm sorry, I can't share that information. "
+                    "Please contact VinBank support for help with your request."
+                )
+
+        # 3. Return (possibly modified) response
+        return llm_response
+
+    @staticmethod
+    def _text_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================

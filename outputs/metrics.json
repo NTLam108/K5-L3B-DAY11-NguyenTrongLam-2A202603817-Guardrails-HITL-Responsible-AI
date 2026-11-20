@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-11-20T08:57:08.664747+00:00",
+  "total_requests": 39,
+  "blocked_requests": 20,
+  "block_rate": 0.5128205128205128,
+  "rate_limit_hits": 5,
+  "judge_checks": 0,
+  "judge_fails": 0,
+  "judge_fail_rate": 0.0,
+  "alerts": [
+    {
+      "metric": "block_rate",
+      "value": 0.5128,
+      "threshold": 0.5,
+      "message": "Block rate 51% > 50% (20/39). Possible attack wave — or guardrails blocking legitimate users (check false positives)."
+    },
+    {
+      "metric": "rate_limit_hits",
+      "value": 5.0,
+      "threshold": 5.0,
+      "message": "5 requests rejected by the rate limiter (threshold 5). Possible flooding / cost attack or a misbehaving client."
+    }
+  ],
+  "blocked_by_layer": {
+    "input_guardrail": 15,
+    "rate_limiter": 5
+  },
+  "thresholds": {
+    "block_rate": 0.5,
+    "rate_limit_hits": 5,
+    "judge_fail_rate": 0.3,
+    "min_requests_for_rate": 5
+  }
+}

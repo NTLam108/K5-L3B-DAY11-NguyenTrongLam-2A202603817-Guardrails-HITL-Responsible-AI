@@ -37,13 +37,30 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # 1. Slide the window: drop timestamps older than (now - window_seconds).
+        #    Deque is time-ordered, so expired entries are always on the left.
+        cutoff = now - self.window_seconds
+        while window and window[0] <= cutoff:
+            window.popleft()
+
+        # 2. Window full → block without calling the LLM.
+        #    Blocked requests are NOT recorded, so a flooding user can't keep
+        #    extending their own ban; they get back in once old requests expire.
+        if len(window) >= self.max_requests:
+            wait = max(0.0, self.window_seconds - (now - window[0]))
+            self.blocked_count += 1
+            return self._block_response(
+                f"Rate limit exceeded: max {self.max_requests} requests per "
+                f"{self.window_seconds}s. Try again in {wait:.0f}s."
+            )
+
+        # 3. Under the limit → record this request and let it through.
+        window.append(now)
+        return None
+
+    def reset(self, user_id: str | None = None) -> None:
+        """Clear the window for one user (or everyone) — handy between test suites."""
+        if user_id is None:
+            self.user_windows.clear()
+        else:
+            self.user_windows.pop(user_id, None)

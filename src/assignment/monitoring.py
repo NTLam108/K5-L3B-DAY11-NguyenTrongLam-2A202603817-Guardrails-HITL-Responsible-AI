@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -41,17 +42,108 @@ class MonitoringAlert:
     judge_checks: int = 0
     judge_fails: int = 0
 
-    def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+    # Rate-based alerts need a minimum sample: 1 blocked out of 1 request is
+    # a 100% block rate but tells us nothing.
+    min_requests_for_rate: int = 5
+    blocked_by_layer: dict[str, int] = field(default_factory=dict)
 
-    def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
+    def record(self, *, blocked: bool, layer: str | None = None) -> None:
+        """Update counters after one request (call from the pipeline)."""
+        self.total_requests += 1
+        if blocked:
+            self.blocked_requests += 1
+            name = layer or "unknown"
+            self.blocked_by_layer[name] = self.blocked_by_layer.get(name, 0) + 1
+            if name == "rate_limiter":
+                self.rate_limit_hits += 1
+
+    def record_judge(self, *, safe: bool) -> None:
+        """Update judge counters (only if LLM-as-Judge is enabled)."""
+        self.judge_checks += 1
+        if not safe:
+            self.judge_fails += 1
+
+    def check_metrics(self, verbose: bool = True) -> list[Alert]:
+        """Compute rates and return the alerts whose thresholds are exceeded.
+
+        Alerts reflect the *current* state: the list is rebuilt on each call,
+        so calling this after every request never piles up duplicates.
+        Rates use ``>`` (strictly above threshold); the rate-limit counter uses
+        ``>=`` (reaching N hits is already a flood signal).
         """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        snap = self.snapshot()
+        alerts: list[Alert] = []
+
+        if (
+            self.total_requests >= self.min_requests_for_rate
+            and snap["block_rate"] > self.block_rate_threshold
+        ):
+            alerts.append(Alert(
+                metric="block_rate",
+                value=round(snap["block_rate"], 4),
+                threshold=self.block_rate_threshold,
+                message=(
+                    f"Block rate {snap['block_rate']:.0%} > {self.block_rate_threshold:.0%} "
+                    f"({self.blocked_requests}/{self.total_requests}). Possible attack wave "
+                    "— or guardrails blocking legitimate users (check false positives)."
+                ),
+            ))
+
+        if self.rate_limit_hits >= self.rate_limit_hit_threshold:
+            alerts.append(Alert(
+                metric="rate_limit_hits",
+                value=float(self.rate_limit_hits),
+                threshold=float(self.rate_limit_hit_threshold),
+                message=(
+                    f"{self.rate_limit_hits} requests rejected by the rate limiter "
+                    f"(threshold {self.rate_limit_hit_threshold}). Possible flooding / "
+                    "cost attack or a misbehaving client."
+                ),
+            ))
+
+        if (
+            self.judge_checks >= self.min_requests_for_rate
+            and snap["judge_fail_rate"] > self.judge_fail_rate_threshold
+        ):
+            alerts.append(Alert(
+                metric="judge_fail_rate",
+                value=round(snap["judge_fail_rate"], 4),
+                threshold=self.judge_fail_rate_threshold,
+                message=(
+                    f"LLM judge flagged {snap['judge_fail_rate']:.0%} of responses as unsafe "
+                    f"(> {self.judge_fail_rate_threshold:.0%}). Model may be leaking or "
+                    "hallucinating — review recent outputs."
+                ),
+            ))
+
+        self.alerts = alerts
+        if verbose:
+            for a in alerts:
+                print(f"[ALERT] {a.metric}: {a.message}")
+        return alerts
+
+    def export_json(self, filepath: str | None = None) -> str:
+        """Write metrics + alerts to JSON under repo-root ``outputs/`` by default.
+
+        Re-evaluates alerts first so the file never contains stale ones.
+        Returns the path written.
+        """
+        self.check_metrics(verbose=False)
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            **self.snapshot(),
+            "blocked_by_layer": dict(self.blocked_by_layer),
+            "thresholds": {
+                "block_rate": self.block_rate_threshold,
+                "rate_limit_hits": self.rate_limit_hit_threshold,
+                "judge_fail_rate": self.judge_fail_rate_threshold,
+                "min_requests_for_rate": self.min_requests_for_rate,
+            },
+        }
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (
